@@ -29,23 +29,46 @@ def get_gspread_client():
 
 def get_river_data():
     """Fetches the latest snapshot of all river gauges from the ArcGIS server."""
-    params = {
-        "where": "1=1",
-        "outFields": "*",
-        "f": "json",
-        "orderByFields": "EditDate DESC",
-        "resultRecordCount": 200
-    }
-    try:
-        r = requests.get(ARCGIS_URL, params=params, timeout=15)
-        data = r.json().get("features", [])
+    all_features = []
+    offset = 0
+    record_count = 2000
 
-        latest_stations = {}
-        for item in data:
+    while True:
+        params = {
+            "where": "1=1",
+            "outFields": "*",
+            "f": "json",
+            "orderByFields": "EditDate DESC",
+            "resultRecordCount": record_count,
+            "resultOffset": offset
+        }
+        try:
+            r = requests.get(ARCGIS_URL, params=params, timeout=30)
+            data = r.json().get("features", [])
+
+            if not data:
+                break
+
+            all_features.extend(data)
+
+            if len(data) < record_count:
+                break
+
+            offset += len(data)
+
+        except Exception as e:
+            print(f"Error fetching ArcGIS data at offset {offset}: {e}")
+            break
+
+    latest_stations = {}
+    try:
+        for item in all_features:
             attr = item['attributes']
             geom = item['geometry']
             raw_name = attr.get("gauge")
 
+            # Since data is ordered by EditDate DESC (newest first),
+            # we only keep the first occurrence of each station.
             if raw_name and raw_name not in latest_stations:
                 # Clean name for Google Sheet tab titles
                 clean_name = raw_name.strip().replace("/", "_").replace(":", "-")
@@ -64,11 +87,11 @@ def get_river_data():
                 }
         return list(latest_stations.values())
     except Exception as e:
-        print(f"Error fetching ArcGIS data: {e}")
+        print(f"Error processing ArcGIS data: {e}")
         return []
 
 def background_sheet_sync():
-    """Background process to update Google Sheets every 1 hour."""
+    """Background process to update Google Sheets every 20 minutes."""
     while True:
         try:
             print(f"[{datetime.now()}] Starting background sync...")
@@ -119,8 +142,8 @@ def background_sheet_sync():
         except Exception as e:
             print(f"Critical background sync error: {e}")
 
-        # Wait for half hour (1800 seconds)
-        time.sleep(1800)
+        # Wait for 20 minutes (1200 seconds)
+        time.sleep(1200)
 
 # Start the background synchronization thread
 # use_reloader=False in app.run is important to prevent starting two threads
@@ -129,7 +152,7 @@ sync_thread.start()
 
 @app.route('/')
 def index():
-    return render_template('index.html')
+    return render_template('index.html', sheet_id=SHEET_ID)
 
 @app.route('/api/data')
 def data_api():
