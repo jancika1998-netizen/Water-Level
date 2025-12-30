@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sri Lanka River Monitor</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; display: flex; height: 100vh; background: #f0f2f5; }
+        #map { flex: 2; height: 100%; border-right: 2px solid #ddd; }
+        #sidebar { flex: 1; padding: 20px; overflow-y: auto; display: flex; flex-direction: column; gap: 15px; }
+        
+        .card { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
+        .sync-badge { display: flex; align-items: center; gap: 10px; color: #2e7d32; font-weight: bold; margin-bottom: 10px; }
+        .pulse { width: 10px; height: 10px; background: #2e7d32; border-radius: 50%; animation: pulse-animation 2s infinite; }
+        
+        @keyframes pulse-animation {
+            0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(46, 125, 50, 0.7); }
+            70% { transform: scale(1); box-shadow: 0 0 0 10px rgba(46, 125, 50, 0); }
+            100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(46, 125, 50, 0); }
+        }
+
+        .status-pill { padding: 5px 12px; border-radius: 20px; font-size: 0.75rem; color: white; text-transform: uppercase; font-weight: bold; float: right; }
+        .normal { background: #007bff; }
+        .warning { background: #ff9800; }
+        .danger { background: #d32f2f; }
+
+        .station-item { padding: 12px; border-bottom: 1px solid #eee; cursor: pointer; transition: 0.2s; }
+        .station-item:hover { background: #f8f9fa; border-radius: 8px; }
+        .station-item strong { display: block; font-size: 1rem; color: #333; }
+        .station-item small { color: #777; }
+    </style>
+</head>
+<body>
+
+<div id="map"></div>
+
+<div id="sidebar">
+    <div class="card">
+        <div class="sync-badge">
+            <div class="pulse"></div>
+            <span>Auto-Sync to Sheets Active</span>
+        </div>
+        <p style="font-size: 0.85rem; color: #666; margin: 0;">Logging data to individual station tabs every 10 mins.</p>
+    </div>
+
+    <div id="details" class="card" style="display:none;">
+        <span id="st-badge" class="status-pill">Normal</span>
+        <h3 id="st-name" style="margin:0 0 10px 0;">Station</h3>
+        <p><strong>Basin:</strong> <span id="st-basin">---</span></p>
+        <p><strong>Water Level:</strong> <span id="st-level" style="font-size: 1.6rem; color: #007bff; font-weight: bold;">---</span> m</p>
+        <div style="font-size: 0.8rem; color: #999; margin-bottom: 15px;">Updated: <span id="st-time">---</span></div>
+        <canvas id="levelChart" width="400" height="250"></canvas>
+    </div>
+
+    <h3 style="margin: 10px 0 5px;">Station Overview</h3>
+    <div id="station-list" class="card" style="padding: 5px; flex-grow: 1; overflow-y: auto;">
+        </div>
+</div>
+
+<script>
+    const map = L.map('map').setView([7.87, 80.77], 8);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '© OpenStreetMap contributors'
+    }).addTo(map);
+
+    let markers = [];
+    let chart;
+
+    async function fetchData() {
+        try {
+            const response = await fetch('/api/data');
+            const data = await response.json();
+            
+            // Refresh Markers
+            markers.forEach(m => map.removeLayer(m));
+            const list = document.getElementById('station-list');
+            list.innerHTML = '';
+
+            data.forEach(st => {
+                // Color Logic
+                let color = "#007bff";
+                if (st.level >= st.major) color = "#d32f2f";
+                else if (st.level >= st.minor) color = "#ff9800";
+                else if (st.level >= st.alert) color = "#fbc02d";
+
+                // Add Marker
+                const marker = L.circleMarker([st.lat, st.lon], {
+                    radius: 10, fillColor: color, color: "#fff", weight: 2, fillOpacity: 0.9
+                }).addTo(map);
+                
+                marker.on('click', () => {
+                    map.setView([st.lat, st.lon], 11);
+                    showDetails(st);
+                });
+                markers.push(marker);
+
+                // Add Sidebar Item
+                const item = document.createElement('div');
+                item.className = 'station-item';
+                item.innerHTML = `<strong>${st.name}</strong><small>${st.basin} • ${st.level}m</small>`;
+                item.onclick = () => {
+                    map.setView([st.lat, st.lon], 11);
+                    showDetails(st);
+                };
+                list.appendChild(item);
+            });
+        } catch (err) { console.error("Update failed:", err); }
+    }
+
+    function showDetails(st) {
+        document.getElementById('details').style.display = 'block';
+        document.getElementById('st-name').innerText = st.name;
+        document.getElementById('st-basin').innerText = st.basin;
+        document.getElementById('st-level').innerText = st.level;
+        document.getElementById('st-time').innerText = st.time;
+
+        const badge = document.getElementById('st-badge');
+        if (st.level >= st.major) { badge.innerText = "Major Flood"; badge.className = "status-pill danger"; }
+        else if (st.level >= st.alert) { badge.innerText = "Alert"; badge.className = "status-pill warning"; }
+        else { badge.innerText = "Normal"; badge.className = "status-pill normal"; }
+
+        if (chart) chart.destroy();
+        const ctx = document.getElementById('levelChart').getContext('2d');
+        chart = new Chart(ctx, {
+            type: 'bar',
+            data: {
+                labels: ['Current', 'Alert', 'Minor', 'Major'],
+                datasets: [{
+                    label: 'Water Level (m)',
+                    data: [st.level, st.alert, st.minor, st.major],
+                    backgroundColor: [st.level >= st.alert ? '#ff9800' : '#007bff', '#fbc02d', '#ff9800', '#d32f2f']
+                }]
+            },
+            options: { responsive: true, scales: { y: { beginAtZero: true } } }
+        });
+    }
+
+    // Run on load and every minute
+    fetchData();
+    setInterval(fetchData, 60000);
+</script>
+</body>
+</html>
