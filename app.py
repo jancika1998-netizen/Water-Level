@@ -4,8 +4,10 @@ import requests
 import gspread
 import threading
 import time
+import csv
+import io
 from datetime import datetime
-from flask import Flask, render_template, jsonify
+from flask import Flask, render_template, jsonify, make_response
 from dotenv import load_dotenv
 from oauth2client.service_account import ServiceAccountCredentials
 
@@ -37,18 +39,18 @@ def get_river_data():
     try:
         r = requests.get(ARCGIS_URL, params=params, timeout=15)
         data = r.json().get("features", [])
-        
+
         latest_stations = {}
         for item in data:
             attr = item['attributes']
             geom = item['geometry']
             raw_name = attr.get("gauge")
-            
+
             if raw_name and raw_name not in latest_stations:
                 # Clean name for Google Sheet tab titles
                 clean_name = raw_name.strip().replace("/", "_").replace(":", "-")
                 edit_date = attr.get("EditDate")
-                
+
                 latest_stations[raw_name] = {
                     "name": clean_name,
                     "basin": attr.get("basin"),
@@ -66,7 +68,7 @@ def get_river_data():
         return []
 
 def background_sheet_sync():
-    """Background process to update Google Sheets every 10 minutes."""
+    """Background process to update Google Sheets every 1 hour."""
     while True:
         try:
             print(f"[{datetime.now()}] Starting background sync...")
@@ -87,7 +89,7 @@ def background_sheet_sync():
                 master_rows = [["Gauge", "Basin", "Lat", "Lon"]]
                 for st in data:
                     master_rows.append([st['name'], st['basin'], st['lat'], st['lon']])
-                
+
                 master.clear()
                 master.update('A1', master_rows)
 
@@ -109,16 +111,16 @@ def background_sheet_sync():
                         if st['level'] >= st['major']: status = "MAJOR FLOOD"
                         elif st['level'] >= st['minor']: status = "MINOR FLOOD"
                         elif st['level'] >= st['alert']: status = "ALERT"
-                        
+
                         ws.append_row([st['time'], st['level'], status])
 
                 print(f"[{datetime.now()}] Sync completed successfully.")
-        
+
         except Exception as e:
             print(f"Critical background sync error: {e}")
-        
-        # Wait for 10 minutes (600 seconds)
-        time.sleep(600)
+
+        # Wait for half hour (1800 seconds)
+        time.sleep(1800)
 
 # Start the background synchronization thread
 # use_reloader=False in app.run is important to prevent starting two threads
@@ -132,6 +134,63 @@ def index():
 @app.route('/api/data')
 def data_api():
     return jsonify(get_river_data())
+
+@app.route('/api/history/<station_name>')
+def history_api(station_name):
+    try:
+        client = get_gspread_client()
+        spreadsheet = client.open_by_key(SHEET_ID)
+        s_title = station_name[:30]
+        ws = spreadsheet.worksheet(s_title)
+
+        # Get all records (including header)
+        rows = ws.get_all_values()
+
+        if len(rows) < 2:
+            return jsonify([]) # No data
+
+        # Parse header is row 0: DateTime, Level (m), Status
+        # We'll return a list of {time, level, status}
+        history = []
+        for row in rows[1:]: # Skip header
+            if len(row) >= 2:
+                try:
+                    level = float(row[1])
+                except ValueError:
+                    level = 0
+                history.append({
+                    "time": row[0],
+                    "level": level,
+                    "status": row[2] if len(row) > 2 else ""
+                })
+
+        return jsonify(history)
+    except Exception as e:
+        print(f"Error fetching history for {station_name}: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/download/<station_name>')
+def download_data(station_name):
+    try:
+        client = get_gspread_client()
+        spreadsheet = client.open_by_key(SHEET_ID)
+        s_title = station_name[:30]
+        ws = spreadsheet.worksheet(s_title)
+
+        rows = ws.get_all_values()
+
+        si = io.StringIO()
+        cw = csv.writer(si)
+        cw.writerows(rows)
+        output = si.getvalue()
+
+        response = make_response(output)
+        response.headers["Content-Disposition"] = f"attachment; filename={station_name}.csv"
+        response.headers["Content-type"] = "text/csv"
+        return response
+    except Exception as e:
+        print(f"Error downloading data for {station_name}: {e}")
+        return f"Error: {e}", 500
 
 if __name__ == '__main__':
     # Local testing: use_reloader=False is mandatory when using threading
