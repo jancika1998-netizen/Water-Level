@@ -119,8 +119,8 @@ def background_sheet_sync():
         except Exception as e:
             print(f"Critical background sync error: {e}")
 
-        # Wait for 1 hour (3600 seconds)
-        time.sleep(3600)
+        # Wait for half hour (1800 seconds)
+        time.sleep(1800)
 
 # Start the background synchronization thread
 # use_reloader=False in app.run is important to prevent starting two threads
