@@ -10,6 +10,7 @@ from datetime import datetime
 from flask import Flask, render_template, jsonify, make_response
 from dotenv import load_dotenv
 from oauth2client.service_account import ServiceAccountCredentials
+from collections import defaultdict
 
 # Load environment variables from .env
 load_dotenv()
@@ -19,6 +20,7 @@ app = Flask(__name__)
 # --- CONFIGURATION ---
 ARCGIS_URL = "https://services3.arcgis.com/J7ZFXmR8rSmQ3FGf/arcgis/rest/services/gauges_2_view/FeatureServer/0/query"
 SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+UPDATE_INTERVAL = 1200  # 20 Minutes in seconds
 
 def get_gspread_client():
     """Authenticates with Google Sheets API using the Service Account JSON."""
@@ -27,59 +29,105 @@ def get_gspread_client():
     creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_json, scope)
     return gspread.authorize(creds)
 
-def get_river_data():
-    """Fetches the latest snapshot of all river gauges from the ArcGIS server."""
-    params = {
-        "where": "1=1",
-        "outFields": "*",
-        "f": "json",
-        "orderByFields": "EditDate DESC",
-        "resultRecordCount": 200
-    }
-    try:
-        r = requests.get(ARCGIS_URL, params=params, timeout=15)
-        data = r.json().get("features", [])
+def get_all_river_data():
+    """
+    Fetches ALL available data from the ArcGIS server using pagination.
+    Returns a dictionary grouped by Station Name containing all historical records.
+    """
+    all_features = []
+    offset = 0
+    record_count = 2000 # Max usually allowed by ArcGIS per request
 
-        latest_stations = {}
-        for item in data:
-            attr = item['attributes']
-            geom = item['geometry']
-            raw_name = attr.get("gauge")
+    print(f"[{datetime.now()}] Fetching data from ArcGIS...")
+    
+    while True:
+        params = {
+            "where": "1=1",
+            "outFields": "*",
+            "f": "json",
+            "orderByFields": "EditDate ASC", # Get oldest first to build history
+            "resultRecordCount": record_count,
+            "resultOffset": offset
+        }
+        
+        try:
+            r = requests.get(ARCGIS_URL, params=params, timeout=30)
+            data = r.json()
+            features = data.get("features", [])
+            
+            if not features:
+                break
+                
+            all_features.extend(features)
+            
+            # If we got fewer records than the limit, we've reached the end
+            if len(features) < record_count:
+                break
+                
+            offset += record_count
+            print(f"... fetched {len(all_features)} records so far...")
+            
+        except Exception as e:
+            print(f"Error fetching ArcGIS data: {e}")
+            break
 
-            if raw_name and raw_name not in latest_stations:
-                # Clean name for Google Sheet tab titles
-                clean_name = raw_name.strip().replace("/", "_").replace(":", "-")
-                edit_date = attr.get("EditDate")
+    # Process and Group Data by Station Name
+    grouped_data = defaultdict(list)
+    
+    for item in all_features:
+        attr = item['attributes']
+        geom = item['geometry']
+        raw_name = attr.get("gauge")
 
-                latest_stations[raw_name] = {
-                    "name": clean_name,
-                    "basin": attr.get("basin"),
-                    "lat": geom.get("y"),
-                    "lon": geom.get("x"),
-                    "level": attr.get("water_level"),
-                    "alert": attr.get("alertpull") or 0,
-                    "minor": attr.get("minorpull") or 0,
-                    "major": attr.get("majorpull") or 0,
-                    "time": datetime.fromtimestamp(edit_date / 1000).strftime('%Y-%m-%d %H:%M:%S') if edit_date else "N/A"
-                }
-        return list(latest_stations.values())
-    except Exception as e:
-        print(f"Error fetching ArcGIS data: {e}")
-        return []
+        if raw_name:
+            # Clean name for Google Sheet tab titles
+            clean_name = raw_name.strip().replace("/", "_").replace(":", "-")
+            edit_date = attr.get("EditDate")
+            
+            # Formatted time string
+            time_str = datetime.fromtimestamp(edit_date / 1000).strftime('%Y-%m-%d %H:%M:%S') if edit_date else "N/A"
+
+            # Determine Status
+            level = attr.get("water_level") or 0
+            alert_lvl = attr.get("alertpull") or 0
+            minor_lvl = attr.get("minorpull") or 0
+            major_lvl = attr.get("majorpull") or 0
+            
+            status = "Normal"
+            if level >= major_lvl and major_lvl > 0: status = "MAJOR FLOOD"
+            elif level >= minor_lvl and minor_lvl > 0: status = "MINOR FLOOD"
+            elif level >= alert_lvl and alert_lvl > 0: status = "ALERT"
+
+            record = {
+                "name": clean_name,
+                "basin": attr.get("basin"),
+                "lat": geom.get("y"),
+                "lon": geom.get("x"),
+                "level": level,
+                "status": status,
+                "time": time_str,
+                "timestamp_raw": edit_date # keep raw for sorting if needed
+            }
+            grouped_data[clean_name].append(record)
+
+    return grouped_data
 
 def background_sheet_sync():
-    """Background process to update Google Sheets every 1 hour."""
+    """Background process to update Google Sheets every 20 minutes."""
     while True:
         try:
-            print(f"[{datetime.now()}] Starting background sync...")
-            data = get_river_data()
-            if not data:
+            print(f"[{datetime.now()}] Starting sync cycle...")
+            
+            # 1. Fetch ALL Data (History included)
+            grouped_data = get_all_river_data()
+            
+            if not grouped_data:
                 print("No data fetched. Skipping this cycle.")
             else:
                 client = get_gspread_client()
                 spreadsheet = client.open_by_key(SHEET_ID)
 
-                # 1. Update Master_Locations Sheet
+                # --- PART A: Update Master Locations (Using only the latest entry per station) ---
                 try:
                     master = spreadsheet.worksheet("Master_Locations")
                 except gspread.WorksheetNotFound:
@@ -87,43 +135,55 @@ def background_sheet_sync():
                     master.append_row(["Gauge", "Basin", "Lat", "Lon"])
 
                 master_rows = [["Gauge", "Basin", "Lat", "Lon"]]
-                for st in data:
-                    master_rows.append([st['name'], st['basin'], st['lat'], st['lon']])
+                
+                # Iterate over stations to get metadata
+                for station_name, records in grouped_data.items():
+                    # records are sorted Oldest -> Newest (from API query), so last is latest
+                    latest = records[-1] 
+                    master_rows.append([latest['name'], latest['basin'], latest['lat'], latest['lon']])
 
                 master.clear()
                 master.update('A1', master_rows)
+                print("Master location sheet updated.")
 
-                # 2. Update Individual Station Sheets
-                for st in data:
-                    s_title = st['name'][:30] # Sheet titles max 31 chars
+                # --- PART B: Update Individual Station Sheets (Backfill History) ---
+                for station_name, records in grouped_data.items():
+                    s_title = station_name[:30] # Sheet titles max 31 chars
+                    
                     try:
                         ws = spreadsheet.worksheet(s_title)
                     except gspread.WorksheetNotFound:
                         ws = spreadsheet.add_worksheet(title=s_title, rows="2000", cols="3")
                         ws.append_row(["DateTime", "Level (m)", "Status"])
+                    
+                    # 1. Get existing timestamps to prevent duplicates
+                    # Pulling column 1 (dates). efficient check.
+                    existing_dates = set(ws.col_values(1)) 
+                    
+                    rows_to_add = []
+                    
+                    for record in records:
+                        if record['time'] not in existing_dates:
+                            rows_to_add.append([record['time'], record['level'], record['status']])
+                    
+                    # 2. Batch Append (Faster than one by one)
+                    if rows_to_add:
+                        ws.append_rows(rows_to_add)
+                        print(f"Updated {station_name}: Added {len(rows_to_add)} new records.")
+                    else:
+                        # print(f"No new data for {station_name}")
+                        pass
 
-                    # Check last recorded time to avoid duplicates
-                    existing_data = ws.get_all_values()
-                    last_recorded_time = existing_data[-1][0] if len(existing_data) > 1 else ""
-
-                    if st['time'] != last_recorded_time:
-                        status = "Normal"
-                        if st['level'] >= st['major']: status = "MAJOR FLOOD"
-                        elif st['level'] >= st['minor']: status = "MINOR FLOOD"
-                        elif st['level'] >= st['alert']: status = "ALERT"
-
-                        ws.append_row([st['time'], st['level'], status])
-
-                print(f"[{datetime.now()}] Sync completed successfully.")
+                print(f"[{datetime.now()}] Sync cycle completed successfully.")
 
         except Exception as e:
             print(f"Critical background sync error: {e}")
 
-        # Wait for half hour (1800 seconds)
-        time.sleep(1800)
+        # Wait for 20 minutes
+        print(f"Sleeping for {UPDATE_INTERVAL} seconds...")
+        time.sleep(UPDATE_INTERVAL)
 
 # Start the background synchronization thread
-# use_reloader=False in app.run is important to prevent starting two threads
 sync_thread = threading.Thread(target=background_sheet_sync, daemon=True)
 sync_thread.start()
 
@@ -133,7 +193,12 @@ def index():
 
 @app.route('/api/data')
 def data_api():
-    return jsonify(get_river_data())
+    # Helper to return just the latest status for the map
+    data = get_all_river_data()
+    latest_only = []
+    for name, records in data.items():
+        latest_only.append(records[-1])
+    return jsonify(latest_only)
 
 @app.route('/api/history/<station_name>')
 def history_api(station_name):
@@ -143,14 +208,11 @@ def history_api(station_name):
         s_title = station_name[:30]
         ws = spreadsheet.worksheet(s_title)
 
-        # Get all records (including header)
         rows = ws.get_all_values()
 
         if len(rows) < 2:
-            return jsonify([]) # No data
+            return jsonify([]) 
 
-        # Parse header is row 0: DateTime, Level (m), Status
-        # We'll return a list of {time, level, status}
         history = []
         for row in rows[1:]: # Skip header
             if len(row) >= 2:
